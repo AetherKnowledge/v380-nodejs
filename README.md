@@ -205,20 +205,25 @@ Assistant or a microphone attached to the LXC.
 1. Rebuild with `npm run build:linux` and replace the executable in your LXC at
    `/opt/v380/v380-linux-x64`. Stop the bridge service before replacing a running
    executable, then start it again. Keep `/opt/v380/config.json` in place.
-2. Merge the `garage2` source list from [deploy/frigate-v380.yaml](deploy/frigate-v380.yaml)
+2. Merge the `ffmpeg` template and `garage2` source list from [deploy/frigate-v380.yaml](deploy/frigate-v380.yaml)
    into your existing Frigate config:
 
    ```yaml
    go2rtc:
+     ffmpeg:
+       v380: "-flags low_delay -probesize 32768 -analyzeduration 100000 -f flv -i {input}"
      streams:
        garage2:
-         - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=aac"
+         - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=copy#input=v380#raw=-max_interleave_delta 100000"
+         - "ffmpeg:garage2#audio=aac"
          - "ffmpeg:garage2#audio=opus"
          - "exec:/opt/v380/v380-linux-x64 --config /opt/v380/config.json speak --alaw-stdin#backchannel=1"
    ```
 
 3. Keep your recording input at `rtsp://127.0.0.1:8554/garage2`, your existing
    WebRTC candidates/port 8555 configuration, and the rest of your camera settings.
+   Keep `output_args.record: preset-record-generic-audio-aac` so Frigate converts
+   G.711 audio to AAC for MP4 recordings.
    Restart Frigate/go2rtc after saving.
 4. Open Frigate at **`https://192.168.254.90:8971`** (or your existing HTTPS URL).
    Open `garage2`'s individual Live view, allow browser microphone permission,
@@ -252,6 +257,25 @@ including a short firmware delay after it closes. Turn Frigate's microphone
 off to hear the camera again. This integration does not enable full-duplex
 audio. Only one talk session should be active at a time.
 
+The primary source copies both codecs instead of waiting for an AAC encoder.
+The separate AAC and Opus sources are available when a player needs them.
+The `v380` input limits format probing to 32 KiB and 100 ms of media analysis;
+it retains the cached keyframe packets instead of discarding them with
+`-fflags nobuffer`. The 100 ms mux interleave limit lets video keep flowing
+when the camera stops sending audio during talk. These settings were checked
+with go2rtc 1.9.8; they reduce bridge-to-go2rtc buffering, but do not change
+camera encoding or a player's own cache.
+
+For direct VLC playback, use `npm run vlc` (200 ms network caching), or open
+the HTTP URL with `vlc --network-caching=200 http://127.0.0.1:8800/live.flv`.
+Use the bridge's configured address and port; loopback URLs work only on the
+same machine. A manually opened URL can use a larger VLC cache. Compare
+native RTSP and HTTP with the same player settings.
+
+See [the LAN investigation report](docs/lan-streaming-investigation.md) for
+APK findings, measured buffering, camera/RTSP comparisons, and remaining
+disconnect limitations.
+
 The browser-to-go2rtc-to-camera-packet path was verified with generated silence
 and a simulated camera against go2rtc **1.9.8**. Frigate **0.14.1**'s microphone
 signaling was checked for compatibility; the installed Frigate configuration
@@ -261,5 +285,5 @@ still needs the source entry above applied locally.
 - The camera connection stays active while the application runs. New viewers receive a complete cached keyframe chain, or wait for the next keyframe if the cache limit was reached.
 - `/live.flv` packages firmware v31 video/audio directly with camera timestamps. The compatibility `/video/stream.flv` endpoint uses one FFmpeg muxer per viewer with arrival timestamps. Camera packets are read when available without timer polling.
 - Legacy audio uses the original guessed codec; firmware v31 audio uses verified IMA WAV blocks decoded by FFmpeg.
-- Timeouts, disconnects, and transport errors automatically retry with fresh authentication after 1, 2, 4, 8, 16, then 30 seconds (capped at 30 seconds). After a stream stays connected for 30 seconds, the next retry starts at 1 second. Invalid credentials or unsupported authentication stop retries.
+- Timeouts, disconnects, and transport errors automatically retry with fresh authentication after 0.25, 0.5, 1, 2, 4, then 5 seconds (capped at 5 seconds). After a stream stays connected for 30 seconds, the next retry starts at 0.25 seconds. Invalid credentials or unsupported authentication stop retries. Authentication and stream inactivity still have a 5-second timeout; retries cannot restore frames while the camera itself is unresponsive.
 - The HTTP server stays running during reconnection. `/live.flv` viewers keep their connection and resume audio/video at a fresh keyframe with continuous playback timestamps. A player may need reopening after a long outage if it times out independently. The FFmpeg/AAC compatibility endpoints close their old feeds; reopen those streams after recovery.

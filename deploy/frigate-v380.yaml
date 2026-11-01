@@ -1,10 +1,16 @@
-# Merge this garage2 source list into your existing Frigate configuration.
+# Merge the ffmpeg template and garage2 sources into your Frigate configuration.
 # Keep your existing WebRTC candidates, camera recording, and other settings.
 # Install the rebuilt executable at /opt/v380/v380-linux-x64 first.
 # The go2rtc service account must be able to read /opt/v380/config.json.
 go2rtc:
+  ffmpeg:
+    # Bound FLV probing; retain probe packets so the cached keyframe is usable.
+    v380: "-flags low_delay -probesize 32768 -analyzeduration 100000 -f flv -i {input}"
   streams:
     garage2:
-      - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=aac"
+      # Copy H.264/PCMU; bound mux waiting while camera audio is muted by talk.
+      - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=copy#input=v380#raw=-max_interleave_delta 100000"
+      # Separate AAC for MSE players; recording converts to AAC in Frigate.
+      - "ffmpeg:garage2#audio=aac"
       - "ffmpeg:garage2#audio=opus"
       - "exec:/opt/v380/v380-linux-x64 --config /opt/v380/config.json speak --alaw-stdin#backchannel=1"

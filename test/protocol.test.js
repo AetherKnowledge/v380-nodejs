@@ -201,7 +201,7 @@ test('credential errors stop; interrupted authentication retries without opening
     assert.equal(app.sockets[0].destroyed, true);
     assert.equal(app.fakeProcess.exitCode, 0);
     assert.equal(app.timers.length, 1);
-    assert.equal(await app.retry(), 1000);
+    assert.equal(await app.retry(), 250);
     assert.equal(app.sockets.length, 2);
   }
 });
@@ -270,7 +270,7 @@ test('stream timeout/end/error/close schedules one retry with fresh auth and rem
     assert.equal(stream.destroyed, true);
     assert.equal(app.timers.length, 1);
     assert.equal(app.resets.length, 1);
-    assert.equal(await app.retry(), 1000);
+    assert.equal(await app.retry(), 250);
     const auth = app.sockets.at(-1); auth.emit('connect');
     assert.equal(auth.writes[0].length, 520);
     const recovered = await openModernStream(app, 1234, auth);
@@ -282,9 +282,9 @@ test('stream timeout/end/error/close schedules one retry with fresh auth and rem
   }
 });
 
-test('reconnect attempts back off to 30 seconds without parallel retries', async () => {
+test('LAN reconnect attempts back off to five seconds without parallel retries', async () => {
   const app = await loadApp();
-  for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+  for (const delay of [250, 500, 1000, 2000, 4000, 5000, 5000]) {
     const socket = app.sockets.at(-1);
     socket.destroy(new Error('camera offline'));
     socket.emit('timeout'); socket.emit('end'); // Duplicate failure signals.
@@ -295,21 +295,54 @@ test('reconnect attempts back off to 30 seconds without parallel retries', async
   assert.equal(app.fakeProcess.exitCode, 0);
 });
 
-test('a stable recovered stream resets reconnect backoff to one second', async () => {
+test('a stable recovered stream resets reconnect backoff to a quarter second', async () => {
   let now = 1000;
   const app = await loadApp({ now: () => now });
   let stream = await openModernStream(app);
   stream.destroy(); await new Promise(setImmediate);
-  assert.equal(await app.retry(), 1000);
+  assert.equal(await app.retry(), 250);
   let auth = app.sockets.at(-1); auth.emit('connect');
   stream = await openModernStream(app, 123, auth);
   stream.destroy(); await new Promise(setImmediate);
-  assert.equal(await app.retry(), 2000);
+  assert.equal(await app.retry(), 500);
   auth = app.sockets.at(-1); auth.emit('connect');
   stream = await openModernStream(app, 456, auth);
   now += 30001;
   stream.destroy(); await new Promise(setImmediate);
-  assert.equal(app.timers[0].delay, 1000);
+  assert.equal(app.timers[0].delay, 250);
+});
+
+test('repeated brief successful sessions cannot leave recovery waiting thirty seconds', async () => {
+  const app = await loadApp();
+  let stream = await openModernStream(app);
+  for (const delay of [250, 500, 1000, 2000, 4000, 5000, 5000]) {
+    stream.destroy();
+    await new Promise(setImmediate);
+    assert.equal(app.timers.length, 1);
+    assert.equal(await app.retry(), delay);
+    const auth = app.sockets.at(-1); auth.emit('connect');
+    stream = await openModernStream(app, 123, auth);
+  }
+  assert.equal(app.initialized.length, 8);
+  assert.equal(app.fakeProcess.exitCode, 0);
+});
+
+test('unknown packet framing reconnects immediately instead of skipping arbitrary payload chunks', async () => {
+  const app = await loadApp();
+  const stream = await openModernStream(app);
+  const unknown = Buffer.alloc(12, 0x9c);
+  stream.receive(unknown.subarray(0, 7), 'readable');
+  await new Promise(setImmediate);
+  assert.equal(stream.destroyed, false);
+  stream.receive(unknown.subarray(7), 'readable');
+  await new Promise(setImmediate);
+  assert.equal(stream.destroyed, true);
+  assert.equal(app.errors.filter(error => /packet marker 0x9c/.test(error)).length, 1);
+  assert.equal(app.timers.length, 1);
+  assert.equal(app.timers[0].delay, 250);
+  assert.equal(stream.listenerCount('end'), 1);
+  stream.emit('timeout');
+  assert.equal(app.timers.length, 1);
 });
 
 test('malformed stream login reconnects instead of throwing from an event callback', async () => {

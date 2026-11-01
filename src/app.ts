@@ -78,13 +78,17 @@ interface IConfigFile {
 
 let preferredModern = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-let reconnectDelay = 1000;
+const INITIAL_RECONNECT_MS = 250;
+const MAX_RECONNECT_MS = 5000;
+let reconnectDelay = INITIAL_RECONNECT_MS;
 
 function reconnect() {
 	if (reconnectTimer !== undefined) return;
 	reset();
 	const delay = reconnectDelay;
-	reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+	// LAN failures should recover promptly even after repeated short sessions.
+	// Keep a bounded backoff while a camera is offline to avoid a retry loop.
+	reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_MS);
 	console.log(`Camera disconnected; reconnecting in ${delay / 1000}s`);
 	reconnectTimer = setTimeout(() => {
 		reconnectTimer = undefined;
@@ -308,7 +312,7 @@ function startStreaming(conf: IConfigFile, resp: any) {
 		console.error(err.message);
 	});
 	socketStream.once('close', () => {
-		if (startedAt && Date.now() - startedAt >= 30000) reconnectDelay = 1000;
+		if (startedAt && Date.now() - startedAt >= 30000) reconnectDelay = INITIAL_RECONNECT_MS;
 		// Drain the old packet reader before clearing shared frame/decryption state.
 		reading.then(reconnect);
 	});
@@ -324,7 +328,9 @@ async function readStreamPacket(socketStream: net.Socket) {
 		} else if (data[0] === 0x6f) {
 			// Should sleep(20 ms)
 		} else {
-			console.error('Unknown data: ' + data[0]);
+			// Unknown framing cannot be recovered by discarding arbitrary 12-byte
+			// chunks: payload bytes would be interpreted as subsequent headers.
+			throw new Error(`Unknown camera stream packet marker 0x${data[0].toString(16).padStart(2, '0')}`);
 		}
 	}
 
