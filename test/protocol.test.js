@@ -18,6 +18,8 @@ function source(name) {
   }).outputText;
 }
 const appSource = source('app.ts');
+const cameraSource = source('camera.ts');
+const configContext = { exports: {}, Buffer, require: name => name === './auth' ? authContext.exports : require(name) };
 const streamSource = source('stream.ts');
 const socketContext = { exports: {} };
 vm.runInNewContext(source('socket.ts'), socketContext);
@@ -25,6 +27,7 @@ const imaContext = { exports: {}, Buffer };
 vm.runInNewContext(source('ima.ts'), imaContext);
 const authContext = { exports: {}, Buffer, require };
 vm.runInNewContext(source('auth.ts'), authContext);
+vm.runInNewContext(source('config.ts'), configContext);
 const liveContext = { exports: {}, Buffer, require: name => name === './ima' ? imaContext.exports : require(name) };
 vm.runInNewContext(source('live.ts'), liveContext);
 const { readCameraBytes } = socketContext.exports;
@@ -64,35 +67,46 @@ class FakeSocket extends EventEmitter {
 }
 
 async function loadApp(clock = Date, argv = [], overrides = {}) {
-  const sockets = [], errors = [], initialized = [], timers = [], resets = [], logs = [], configPaths = [];
+  const sockets = [], errors = [], initialized = [], timers = [], resets = [], logs = [], configPaths = [], bindings = [];
   const spoken = [];
   const fakeProcess = { argv, exitCode: 0 };
-  vm.runInNewContext(appSource, {
-    exports: {}, Buffer, process: fakeProcess, Date: clock,
+  const credentials = { id: config.id, ip: config.ip, username: config.username, password: config.password };
+  const shared = {
+    Buffer, Date: clock,
     setTimeout(callback, delay) { const timer = { callback, delay }; timers.push(timer); return timer; },
+    clearTimeout(timer) { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1); },
     console: { log: message => logs.push(message), error: error => errors.push(String(error)) },
+  };
+  const cameraContext = { ...shared, exports: {}, require(name) {
+    if (name === './auth') return authContext.exports;
+    if (name === './socket') return socketContext.exports;
+    if (name === 'net') return { connect() { const socket = new FakeSocket(); sockets.push(socket); return socket; } };
+    return require(name);
+  } };
+  vm.runInNewContext(cameraSource, cameraContext);
+  vm.runInNewContext(appSource, {
+    ...shared, exports: {}, process: fakeProcess,
     require(name) {
       if (name === 'process') return fakeProcess;
       if (name === './discovery') return {};
-      if (name === './auth') return authContext.exports;
+      if (name === './config') return configContext.exports;
+      if (name === './camera') return cameraContext.exports;
       if (name === './speak') return { runSpeak: (...args) => spoken.push(args) };
-      if (name === './socket') return socketContext.exports;
-      if (name === './live') return liveContext.exports;
-      if (name === './stream') return { init: (...args) => initialized.push(args), reset: () => resets.push(true), handleStream() {} };
-      if (name === 'fs') return {
-        stat: (file, cb) => { configPaths.push(file); cb(null, {}); },
-        readFile: (file, cb) => { configPaths.push(file); cb(null, Buffer.from(JSON.stringify({ ...config, ...overrides }))); },
-      };
-      if (name === 'net') return { connect() {
-        const socket = new FakeSocket();
-        sockets.push(socket);
-        return socket;
+      if (name === './stream') return { createStreamServer(port, options, host) {
+        bindings.push({port, host});
+        const server = new EventEmitter(); server.close = () => {}; server.closeAllConnections = () => {};
+        return { server, cameras: new Map([...options.keys()].map(name => [name, {
+          init: (...args) => initialized.push([port, ...args]), reset: () => resets.push(name), handleStream() {},
+        }])) };
+      } };
+      if (name === 'fs/promises') return { readFile: async file => {
+        configPaths.push(file); return JSON.stringify({serverPort: config.serverPort, garage: credentials, ...overrides});
       } };
       return require(name);
     },
   });
   await new Promise(setImmediate);
-  return { sockets, errors, initialized, fakeProcess, timers, resets, logs, spoken, configPaths,
+  return { sockets, errors, initialized, fakeProcess, timers, resets, logs, spoken, configPaths, bindings,
     async retry() {
       assert.ok(timers.length, 'Expected a scheduled reconnect');
       const timer = timers.shift(); timer.callback();
@@ -122,7 +136,7 @@ test('speak CLI dispatch uses existing config without opening the video connecti
 
 test('go2rtc CLI uses explicit config path without starting the video server', async () => {
   const app = await loadApp(Date, ['node', 'app.ts', '--config', '/opt/v380/config.json', 'speak', '--alaw-stdin']);
-  assert.deepEqual(app.configPaths, ['/opt/v380/config.json', '/opt/v380/config.json']);
+  assert.deepEqual(app.configPaths, ['/opt/v380/config.json']);
   assert.equal(app.sockets.length, 0);
   assert.equal(app.initialized.length, 0);
   assert.equal(app.spoken.length, 1);
@@ -233,7 +247,7 @@ test('fragmented newer replies preserve stream boundaries and use the new start 
   assert.equal(app.initialized[0][2].version, 31);
 });
 
-test('zero-sized video metadata never starts the HTTP server', async () => {
+test('zero-sized video metadata never initializes camera media', async () => {
   const app = await loadApp();
   app.sockets[0].receive(authReply());
   const socket = app.sockets[1];
@@ -247,6 +261,20 @@ test('zero-sized video metadata never starts the HTTP server', async () => {
   assert.equal(app.initialized.length, 0);
 });
 
+test('audio-only session accepts zero video dimensions while preserving the verified wire request', async () => {
+  const app = await loadApp(Date, [], {garage: {...config, serverPort: undefined, audioOnly: true}});
+  const modern = await modernAttempt(app);
+  modern.receive(authReply(1168, 1001, 31));
+  const stream = app.sockets.at(-1); stream.emit('connect');
+  assert.equal(stream.writes[0].readUInt32LE(22), 4097);
+  const metadata = Buffer.alloc(32);
+  metadata.writeInt32LE(401); metadata.writeInt32LE(1001, 4); metadata.writeUInt16LE(20, 8);
+  stream.receive(metadata, 'readable');
+  assert.equal(stream.destroyed, false);
+  assert.equal(app.initialized.length, 1);
+  assert.equal(stream.writes[1].readUInt32LE(0), 303);
+});
+
 async function openModernStream(app, ticket = 42, socket = undefined) {
   const auth = socket || await modernAttempt(app);
   const reply = authReply(1168, 1001, 31); reply.writeUInt32LE(ticket, 13);
@@ -258,6 +286,67 @@ async function openModernStream(app, ticket = 42, socket = undefined) {
   stream.receive(metadata, 'readable');
   return stream;
 }
+
+test('two cameras keep protocol selection, retries, and resets independent on one HTTP listener', async () => {
+  const other = {id: '987654321', ip: '127.0.0.2', username: 'other', password: 'another-password'};
+  const app = await loadApp(Date, [], {front_door: other});
+  assert.equal(app.sockets.length, 2);
+  assert.equal(app.bindings.length, 1);
+  const garageAuth = app.sockets[0], frontAuth = app.sockets[1];
+  garageAuth.emit('connect'); garageAuth.receive(authReply(-100));
+  const garageModern = app.sockets.at(-1); garageModern.emit('connect');
+  const garage = await openModernStream(app, 77, garageModern);
+  frontAuth.emit('connect');
+  assert.equal(frontAuth.writes[0].length, 256);
+  assert.equal(frontAuth.writes[0].readUInt32LE(13), Number(other.id));
+  frontAuth.receive(authReply());
+  const front = app.sockets.at(-1); front.emit('connect');
+  const metadata = Buffer.alloc(18);
+  metadata.writeInt32LE(401); metadata.writeInt32LE(1001, 4);
+  metadata.writeUInt16LE(20, 8); metadata.writeUInt32LE(640, 10); metadata.writeUInt32LE(480, 14);
+  front.receive(metadata, 'readable');
+  assert.equal(app.initialized.length, 2);
+  garage.emit('timeout'); await new Promise(setImmediate);
+  assert.deepEqual(app.resets, ['garage']);
+  assert.equal(front.destroyed, false);
+  assert.equal(await app.retry(), 250);
+  const retry = app.sockets.at(-1); retry.emit('connect');
+  assert.equal(retry.writes[0].length, 520);
+  retry.destroy(new Error('offline'));
+  front.emit('timeout'); await new Promise(setImmediate);
+  assert.deepEqual(app.timers.map(timer => timer.delay), [500, 250]);
+  app.timers.splice(1, 1)[0].callback(); await new Promise(setImmediate);
+  const frontRetry = app.sockets.at(-1); frontRetry.emit('connect');
+  assert.equal(frontRetry.writes[0].length, 256);
+  assert.equal(frontRetry.writes[0].readUInt32LE(13), Number(other.id));
+  assert.equal(app.fakeProcess.exitCode, 0);
+});
+
+test('one camera rejecting credentials leaves the other camera running', async () => {
+  const app = await loadApp(Date, [], {front_door: {id: '42', ip: '127.0.0.2', username: 'other', password: ''}});
+  const good = app.sockets[1];
+  app.sockets[0].receive(authReply(1168, 1012));
+  assert.equal(app.fakeProcess.exitCode, 0);
+  assert.equal(good.destroyed, false);
+  const stream = await openModernStream(app, 78, good);
+  assert.equal(stream.destroyed, false);
+  assert.equal(app.initialized.length, 1);
+  assert.ok(app.errors.some(error => error.includes('[garage]') && error.includes('password')));
+});
+
+test('speaker commands require a selection for multiple cameras and never start the HTTP server', async () => {
+  const other = {id: '42', ip: '127.0.0.2', username: 'other', password: ''};
+  const selected = await loadApp(Date, ['node', 'app.ts', 'speak', '--test', '--camera', 'front_door'], {front_door: other});
+  assert.equal(selected.spoken[0][0].id, other.id);
+  assert.deepEqual(Array.from(selected.spoken[0][1]), ['--test']);
+  assert.equal(selected.bindings.length, 0);
+  assert.equal(selected.sockets.length, 0);
+  const missing = await loadApp(Date, ['node', 'app.ts', 'speak', '--test'], {front_door: other});
+  assert.equal(missing.fakeProcess.exitCode, 1);
+  assert.equal(missing.spoken.length, 0);
+  assert.equal(missing.bindings.length, 0);
+  assert.ok(missing.errors.some(error => error.includes('Select a camera')));
+});
 
 test('stream timeout/end/error/close schedules one retry with fresh auth and remembered protocol', async () => {
   for (const event of ['timeout', 'end', 'error', 'close']) {
@@ -379,19 +468,28 @@ test('legacy stream-start bytes stay compatible for all accepted response codes'
 
 function loadMedia(auth, ffmpegFactory, listenHost) {
   const routes = {}, listens = [];
+  const createRouter = () => ({ get(url, handler) { routes[url] = handler; } });
+  const express = () => ({ get() {}, use() {}, listen: (port, host) => listens.push({port, host}) });
+  express.Router = createRouter;
   const context = { exports: {}, Buffer, console: { log() {}, error() {} }, setTimeout,
     require(name) {
-      if (name === 'express') return () => ({ listen: (port, host) => listens.push({ port, host }), get: (url, handler) => { routes[url] = handler; } });
+      if (name === 'express') return express;
       if (name === './socket') return socketContext.exports;
       if (name === './live') return liveContext.exports;
       if (name === 'fluent-ffmpeg' && ffmpegFactory) return ffmpegFactory;
       return require(name);
     },
   };
-  vm.runInNewContext(streamSource + '\nglobalThis.decodeForTest = decodeVideoFrame; globalThis.audioForTest = { decode: decodeAudioFrame, waveHeader: createAudioWaveHeader, streams: audStreams }; globalThis.clientsForTest = { createStream, removeStream, video: vidStreams, cached: () => ({ iFrame, pFrame }) };', context);
-  context.routesForTest = routes;
-  context.listensForTest = listens;
-  context.exports.init(4000, { width: 1920, height: 1080, maybeFps: 20 }, auth, listenHost);
+  const instrumented = streamSource.replace('return { init, reset, handleStream, router: app, serveLive };',
+    'return { init, reset, handleStream, router: app, serveLive, decodeForTest: decodeVideoFrame, audioForTest: { decode: decodeAudioFrame, waveHeader: createAudioWaveHeader, streams: audStreams }, clientsForTest: { createStream, removeStream, video: vidStreams, cached: () => ({ iFrame, pFrame }) } };');
+  assert.notEqual(instrumented, streamSource, 'Expected per-camera test instrumentation point');
+  vm.runInNewContext(instrumented, context);
+  const camera = context.exports.createStreamServer(4000, new Map([['camera', {}]]), listenHost).cameras.get('camera');
+  context.exports = { init: (port, packet, auth) => camera.init(packet, auth), reset: camera.reset, handleStream: camera.handleStream };
+  context.decodeForTest = camera.decodeForTest; context.audioForTest = camera.audioForTest; context.clientsForTest = camera.clientsForTest;
+  routes['/live.flv'] = camera.serveLive;
+  context.routesForTest = routes; context.listensForTest = listens;
+  camera.init({ width: 1920, height: 1080, maybeFps: 20 }, auth);
   return context;
 }
 
@@ -409,7 +507,7 @@ test('HTTP binds to loopback by default and only exposes other interfaces when c
 test('configured serverHost is passed from config through camera login to the HTTP server', async () => {
   const app = await loadApp(Date, [], { serverHost: '0.0.0.0' });
   await openModernStream(app);
-  assert.equal(app.initialized[0][3], '0.0.0.0');
+  assert.equal(app.bindings[0].host, '0.0.0.0');
 });
 
 test('FFmpeg internal audio follows wildcard, IPv6, and specific-interface bindings', async () => {
@@ -422,7 +520,7 @@ test('FFmpeg internal audio follows wildcard, IPv6, and specific-interface bindi
     const media = loadMedia({ version: 31, authTicket: 42 }, () => command, host);
     const response = new PassThrough(); response.contentType = () => {};
     media.routesForTest['/video/:filename']({}, response);
-    assert.equal(inputs[1], `http://${expected}:4000/audio/stream.wav`);
+    assert.equal(inputs[1], `http://${expected}:4000/camera/audio/stream.wav`);
     response.destroy();
   }
   await new Promise(setImmediate);

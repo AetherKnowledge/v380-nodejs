@@ -1,0 +1,21 @@
+# Bridge config.json: set garage.audioOnly to true, then restart the bridge.
+# Merge this example into Frigate; keep existing WebRTC candidates and cameras.
+go2rtc:
+    ffmpeg:
+        v380: "-flags low_delay -probesize 32768 -analyzeduration 100000 -f flv -i {input}"
+    streams:
+        garage2:
+            # Video comes directly from the camera's RTSP service.
+            - "rtsp://192.168.254.92/vs0"
+            # Bridge emits silence when mic/audio packets stop, including talk.
+            # Native RTSP video must still be available for video to continue.
+            - "ffmpeg:http://127.0.0.1:8800/garage/audio.flv#audio=copy#input=v380"
+            - "ffmpeg:garage2#audio=aac"
+            - "ffmpeg:garage2#audio=opus"
+            - "exec:/opt/v380/v380-linux-x64 --config /opt/v380/config.json --camera garage speak --alaw-stdin#backchannel=1"
+
+# Keep camera recording input: rtsp://127.0.0.1:8554/garage2
+# Keep output_args.record: preset-record-generic-audio-aac
+# For an audio-only go2rtc stream, omit the camera's RTSP video source and
+# use a separate name, e.g. garage_audio. Change the AAC/Opus self-references
+# to ffmpeg:garage_audio#audio=aac and ffmpeg:garage_audio#audio=opus.

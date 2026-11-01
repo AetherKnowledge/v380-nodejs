@@ -75,6 +75,118 @@ function viewer(live) {
   return { output, chunks };
 }
 
+test('audio-only FLV starts on audio without a video keyframe and survives clock resets', t => {
+  const live = new LiveFlv(true), first = viewer(live);
+  assert.equal(Buffer.concat(first.chunks)[4], 4, 'FLV header must advertise only audio');
+  live.video(Buffer.alloc(5), 800); // Irrelevant video must not be parsed.
+  live.audio(Buffer.alloc(256), 1000);
+  live.audio(Buffer.alloc(256), 1063);
+  assert.deepEqual(tags(first.chunks).map(packet => [packet.type, packet.time]), [[8, 0], [8, 63]]);
+  const decoded = ffmpeg(['-f', 'flv', '-i', 'pipe:0', '-f', 's16le', 'pipe:1'], Buffer.concat(first.chunks), t);
+  if (decoded) assert.equal(decoded.length, 505 * 2 * 2);
+  live.reset();
+  live.audio(Buffer.alloc(256), 10);
+  assert.equal(first.output.destroyed, false);
+  assert.ok(tags(first.chunks).at(-1).time > 63);
+  const late = viewer(live);
+  live.audio(Buffer.alloc(256), 73);
+  assert.deepEqual(tags(late.chunks).map(packet => [packet.type, packet.time]), [[8, 0]]);
+  first.output.destroy(); late.output.destroy();
+});
+
+function controlledLive(audioOnly) {
+  let now = 0;
+  const timers = new Map();
+  const fixture = {exports: {}, Buffer, require(name) {
+    if (name === './ima') return imaContext.exports;
+    if (name === 'perf_hooks') return {performance: {now: () => now}};
+    if (name === 'timers') return {
+      setInterval(callback) { const timer = {unref() {}}; timers.set(timer, callback); return timer; },
+      clearInterval(timer) { timers.delete(timer); },
+    };
+    return require(name);
+  }};
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname, '../src/live.ts'), 'utf8'), {
+    compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2017},
+  }).outputText, fixture);
+  return {live: new fixture.exports.LiveFlv(audioOnly), timers, tick(time) {
+    now = time;
+    for (const callback of timers.values()) callback();
+  }};
+}
+
+test('audio-only consumers receive paced silence before audio and across camera outages, then resume real samples', async () => {
+  const clock = controlledLive(true), first = viewer(clock.live);
+  assert.equal(clock.timers.size, 1);
+  clock.tick(199);
+  assert.equal(tags(first.chunks).length, 0);
+  clock.tick(200);
+  let packets = tags(first.chunks);
+  assert.deepEqual(packets.map(packet => [packet.type, packet.time]), [[8, 0]]);
+  assert.ok(packets[0].payload.subarray(1).every(byte => byte === 0xff));
+  const pcm = Buffer.alloc(256); pcm.writeInt16LE(1000);
+  clock.tick(264);
+  clock.live.audio(pcm, 9000000);
+  packets = tags(first.chunks);
+  assert.ok(packets.at(-1).payload.subarray(1).every(byte => byte === 0xce));
+  const before = packets.at(-1).time;
+  clock.live.reset();
+  clock.tick(1200);
+  packets = tags(first.chunks);
+  assert.ok(packets.at(-1).time > before);
+  assert.ok(packets.at(-1).payload.subarray(1).every(byte => byte === 0xff));
+  const beforeResume = packets.at(-1).time;
+  clock.live.audio(pcm, 10); // Camera clock/session resets during outage.
+  packets = tags(first.chunks);
+  assert.ok(packets.at(-1).time > beforeResume);
+  assert.ok(packets.at(-1).payload.subarray(1).every(byte => byte === 0xce));
+  assert.equal(first.output.destroyed, false);
+  first.output.destroy(); await new Promise(setImmediate);
+  assert.equal(clock.timers.size, 0, 'No timer remains after last HTTP consumer disconnects');
+});
+
+test('full video feed keeps video and silent audio flowing during talk, dropping overlapping stale samples on return', async () => {
+  const clock = controlledLive(false), first = viewer(clock.live);
+  clock.live.video(key, 1000);
+  clock.live.audio(Buffer.alloc(256), 1000);
+  for (let time = 50; time <= 1000; time += 50) {
+    clock.live.video(predicted, 1000 + time);
+    clock.tick(time);
+  }
+  let packets = tags(first.chunks);
+  assert.equal(packets.filter(packet => packet.type === 9).at(-1).time, 1000);
+  const silent = packets.filter(packet => packet.type === 8 && packet.payload.length > 2);
+  assert.ok(silent.length > 8);
+  assert.ok(silent.at(-1).payload.subarray(1).every(byte => byte === 0xff));
+  const count = packets.length;
+  clock.live.audio(Buffer.alloc(256), 1063); // Buffered packet is older than filled silence.
+  assert.equal(tags(first.chunks).length, count);
+  const block = Buffer.alloc(256); block.writeInt16LE(1000);
+  clock.live.audio(block, 2000);
+  packets = tags(first.chunks);
+  assert.equal(packets.at(-1).time, 1000);
+  assert.ok(packets.at(-1).payload.subarray(1).every(byte => byte === 0xce));
+  const audio = packets.filter(packet => packet.type === 8);
+  assert.ok(audio.every((packet, index) => !index || packet.time >= audio[index - 1].time));
+  first.output.destroy(); await new Promise(setImmediate);
+  assert.equal(clock.timers.size, 0);
+});
+
+test('event-loop stalls and rapid buffered-audio bursts cannot create unbounded catch-up output', async () => {
+  const clock = controlledLive(true), first = viewer(clock.live);
+  clock.tick(200);
+  const before = tags(first.chunks).length;
+  clock.tick(60000);
+  assert.ok(tags(first.chunks).length - before <= 4);
+  for (let index = 0; index < 100; index++) clock.live.audio(Buffer.alloc(256), index * 63);
+  assert.ok(tags(first.chunks).length - before <= 6);
+  Object.defineProperty(first.output, 'writableLength', {value: 8 * 1024 * 1024});
+  clock.tick(60500);
+  assert.equal(first.output.destroyed, true);
+  assert.equal(clock.timers.size, 0);
+  await new Promise(setImmediate);
+});
+
 test('live A/V uses one camera clock, joins at keyframes, and sends G.711 at 8kHz', t => {
   const live = new LiveFlv();
   const first = viewer(live);

@@ -1,4 +1,6 @@
 import { Writable } from 'stream';
+import { performance } from 'perf_hooks';
+import { setInterval, clearInterval } from 'timers';
 
 import { decodeImaWave } from './ima';
 export { decodeImaWave } from './ima';
@@ -53,15 +55,25 @@ export function flvTag(type: number, timestamp: number, payload: Buffer): Buffer
 	return tag;
 }
 
-interface Viewer { output: Writable; base?: number; videoTime: number; audioTime: number; joinedAt: number; offset: number; }
+interface Viewer {
+	output: Writable; base?: number; videoTime: number; audioTime: number; joinedAt: number; offset: number;
+	audioNext?: number; audioDueAt?: number; audioOrigin?: number;
+}
 const MAX_BYTES = 8 * 1024 * 1024;
+const AUDIO_GAP_MS = 200;
+const SILENCE_SAMPLES = 505;
+const SILENCE_MS = SILENCE_SAMPLES / 8;
+const SILENCE = Buffer.concat([Buffer.from([0x82]), Buffer.alloc(SILENCE_SAMPLES, 0xff)]);
 
 export class LiveFlv {
+	constructor(private readonly audioOnly = false) {}
+
 	private viewers = new Set<Viewer>();
 	private config?: Buffer;
 	private cache: Buffer[] = [];
 	private cacheBytes = 0;
 	private latest = 0;
+	private silenceTimer?: ReturnType<typeof setInterval>;
 
 	reset() {
 		this.config = undefined;
@@ -69,22 +81,33 @@ export class LiveFlv {
 		this.cacheBytes = 0;
 		this.latest = 0;
 		for (const viewer of this.viewers) {
+			// Independent audio consumers keep their clock and receive silence
+			// across camera reauthentication; they never need a new video IDR.
+			if (this.audioOnly) continue;
 			viewer.base = undefined;
 			viewer.offset = Math.max(viewer.videoTime, viewer.audioTime) + 1;
+			viewer.audioNext = undefined;
+			viewer.audioDueAt = undefined;
+			viewer.audioOrigin = undefined;
 		}
 	}
 
 	attach(output: Writable) {
-		const viewer: Viewer = { output, videoTime: 0, audioTime: 0, joinedAt: Date.now(), offset: 0 };
+		const viewer: Viewer = { output, videoTime: 0, audioTime: 0, joinedAt: Date.now(), offset: 0,
+			audioDueAt: this.audioOnly ? performance.now() + AUDIO_GAP_MS : undefined };
 		this.viewers.add(viewer);
-		output.once('close', () => this.viewers.delete(viewer));
-		this.write(viewer, Buffer.from('464c5601050000000900000000', 'hex'));
+		output.once('close', () => this.remove(viewer));
+		this.write(viewer, Buffer.from(this.audioOnly ? '464c5601040000000900000000' : '464c5601050000000900000000', 'hex'));
 		if (this.config && this.cache.length) {
 			this.start(viewer, this.latest);
 			this.write(viewer, flvTag(9, 0, this.config));
 			// Prime decoder references at time zero, then start its live clock at
 			// the newest frame. Replaying historical durations adds a whole GOP delay.
 			for (const payload of this.cache) this.write(viewer, flvTag(9, 0, payload));
+		}
+		if (this.viewers.size && !this.silenceTimer) {
+			this.silenceTimer = setInterval(() => this.fillAudioGaps(), 25);
+			this.silenceTimer.unref();
 		}
 	}
 
@@ -93,19 +116,58 @@ export class LiveFlv {
 		viewer.base = timestamp - viewer.offset;
 		viewer.videoTime = viewer.offset;
 		viewer.audioTime = viewer.offset;
+		viewer.audioNext = viewer.offset;
+		viewer.audioOrigin = performance.now() - viewer.offset;
+		viewer.audioDueAt = performance.now() + AUDIO_GAP_MS;
 		// Announce audio before a large IDR exhausts the player's probe budget.
 		// One mu-law silence sample (0.125 ms) declares the codec without delay.
-		this.write(viewer, flvTag(8, viewer.offset, Buffer.from([0x82, 0xff])));
+		if (!this.audioOnly) this.write(viewer, flvTag(8, viewer.offset, Buffer.from([0x82, 0xff])));
 	}
 
 	private write(viewer: Viewer, data: Buffer) {
 		if (viewer.output.destroyed || viewer.output.writableLength + data.length > MAX_BYTES) {
-			this.viewers.delete(viewer);
+			this.remove(viewer);
 			viewer.output.destroy();
 		} else viewer.output.write(data);
 	}
 
+	private remove(viewer: Viewer) {
+		this.viewers.delete(viewer);
+		if (!this.viewers.size && this.silenceTimer) {
+			clearInterval(this.silenceTimer);
+			this.silenceTimer = undefined;
+		}
+	}
+
+	private writeAudio(viewer: Viewer, payload: Buffer, time: number) {
+		viewer.audioTime = time;
+		viewer.audioNext = time + (payload.length - 1) / 8;
+		this.write(viewer, flvTag(8, time, payload));
+	}
+
+	private fillAudioGaps() {
+		const now = performance.now();
+		for (const viewer of this.viewers) {
+			if (viewer.audioDueAt === undefined || now < viewer.audioDueAt) continue;
+			if (this.audioOnly && viewer.base === undefined) {
+				this.start(viewer, 0);
+				viewer.audioDueAt = now;
+			}
+			if (viewer.base === undefined || viewer.audioNext === undefined) continue;
+			// A stalled event loop must not enqueue seconds of catch-up audio.
+			if (now - viewer.audioDueAt! > 4 * SILENCE_MS) {
+				viewer.audioNext += now - viewer.audioDueAt!;
+				viewer.audioDueAt = now;
+			}
+			for (let sent = 0; sent < 4 && this.viewers.has(viewer) && now >= viewer.audioDueAt!; sent++) {
+				this.writeAudio(viewer, SILENCE, viewer.audioNext!);
+				viewer.audioDueAt! += SILENCE_MS;
+			}
+		}
+	}
+
 	video(frame: Buffer, timestamp: number) {
+		if (this.audioOnly) return;
 		const units = nals(frame);
 		const keyframe = units.some(nal => (nal[0] & 31) === 5);
 		if (keyframe) {
@@ -144,10 +206,27 @@ export class LiveFlv {
 	audio(blocks: Buffer, timestamp: number) {
 		if (!this.viewers.size) return;
 		const payload = Buffer.concat([Buffer.from([0x82]), audioToMulaw(blocks)]);
+		const now = performance.now();
 		for (const viewer of this.viewers) {
-			if (viewer.base === undefined || timestamp < viewer.base) continue;
-			viewer.audioTime = Math.max(viewer.audioTime, timestamp - viewer.base);
-			this.write(viewer, flvTag(8, viewer.audioTime, payload));
+			if (this.audioOnly && viewer.base === undefined) this.start(viewer, timestamp);
+			if (viewer.base === undefined) continue;
+			if (this.audioOnly) {
+				// Pace timestamps by samples, independent of camera clock resets.
+				// Bound latency if a recovering camera bursts buffered audio.
+				if (viewer.audioNext! > now - viewer.audioOrigin! + 250) continue;
+				this.writeAudio(viewer, payload, viewer.audioNext!);
+			} else {
+				if (timestamp < viewer.base) continue;
+				const time = timestamp - viewer.base;
+				const overlap = viewer.audioNext! - time;
+				// Permit sub-millisecond timestamp rounding. Drop already-filled
+				// samples if delayed audio arrives after silence was emitted.
+				const skip = overlap > 1 ? Math.ceil(overlap * 8) : 0;
+				if (skip >= payload.length - 1) continue;
+				const fresh = skip ? Buffer.concat([payload.subarray(0, 1), payload.subarray(skip + 1)]) : payload;
+				this.writeAudio(viewer, fresh, Math.max(time, viewer.audioNext!));
+			}
+			viewer.audioDueAt = now + (payload.length - 1) / 8 + AUDIO_GAP_MS;
 		}
 	}
 }
