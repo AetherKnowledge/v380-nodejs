@@ -10,6 +10,8 @@
   "scripts": {
     "start": "ts-node src/app.ts",
     "vlc": "node scripts/vlc.js",
+    "speak": "ts-node src/app.ts speak",
+    "test:speaker": "node scripts/test-speaker.js",
     "test": "node --test test/*.test.js",
     "dev": "node --watch --require ts-node/register src/app.ts",
     "dev2": "node --watch --inspect=7321 --require ts-node/register src/app.ts",

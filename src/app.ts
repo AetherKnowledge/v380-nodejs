@@ -1,5 +1,6 @@
 import { argv } from 'process';
-import * as crypto from 'crypto';
+import { createLoginRequest } from './auth';
+import { runSpeak } from './speak';
 import * as discovery from './discovery';
 import * as t from 'typebase';
 import * as net from 'net';
@@ -10,17 +11,6 @@ import { readCameraBytes } from './socket';
 
 const readFileAsync = promisify(fs.readFile);
 const statAsync = promisify(fs.stat);
-
-const loginStruct = t.Struct.define([
-	['command', t.i32],
-	['unknown1', t.ui32], // 120 = LoginFromServerEX, 1002 = LoginFromMRServerEX, 1022 = our
-	['unknown2', t.ui8], // 1, 2=our
-	['unknown3', t.ui32],
-	['deviceId', t.ui32], // 10 = LoginFromServerEX, 11 = LoginFromMRServerEX, 1=our
-	['hostDateTime', t.List.define(t.ui8, 32)], // optional - maybe related to unk1/2, on v380 pc this is a domain name
-	['username', t.List.define(t.ui8, 32)],
-	['password', t.List.define(t.ui8, 64)], // legacy sends 32 bytes; newer firmware sends 64
-]);
 
 const streamLoginLanStruct = t.Struct.define([
 	['command', t.i32],
@@ -83,40 +73,7 @@ interface IConfigFile {
 	username: string;
 	password: string;
 	serverPort: number;
-}
-
-function generatePassword(password: string, modern = false) {
-	const generateRandomPrintable = (length: number) => {
-		const set = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890!@#$%^&*()_+-=';
-		let s = '';
-
-		for (let i = 0; i < length; i++) {
-			s += set[Math.floor(Math.random() * set.length)];
-		}
-
-		return s;
-	}
-
-	const nBlockLen = 16;
-	const randomKey = generateRandomPrintable(nBlockLen);
-	const staticKey = 'macrovideo+*#!^@';
-	const passwordBytes = Buffer.from(password);
-	const paddedLength = modern ? 48 : Math.ceil((passwordBytes.length + 1) / nBlockLen) * nBlockLen;
-	if (passwordBytes.length > paddedLength) {
-		throw new Error('Camera device password exceeds 48 bytes');
-	}
-	const paddedPassword = Buffer.alloc(paddedLength);
-	passwordBytes.copy(paddedPassword);
-
-	const cipher1 = crypto.createCipheriv('aes-128-ecb', staticKey, null);
-	const cipher2 = crypto.createCipheriv('aes-128-ecb', randomKey, null);
-
-	cipher1.setAutoPadding(false);
-	cipher2.setAutoPadding(false);
-	const res1 = Buffer.concat([cipher1.update(paddedPassword), cipher1.final()]);
-	const res2 = Buffer.concat([cipher2.update(res1), cipher2.final()]);
-
-	return Buffer.concat([Buffer.from(randomKey), res2]);
+	serverHost?: string;
 }
 
 let preferredModern = false;
@@ -139,7 +96,12 @@ function reconnect() {
 }
 
 async function entry(modern = preferredModern) {
-	if (argv.indexOf('discover') >= 0) {
+	const args = argv.slice(2);
+	const configPath = args[0] === '--config' ? args.splice(0, 2)[1] : './config.json';
+	if (!configPath || configPath.startsWith('--')) {
+		throw new Error('Usage: [--config /path/config.json] [speak ... | discover]');
+	}
+	if (args[0] === 'discover') {
 		console.log('Discovering...');
 		const res = discovery.discover();
 		console.log(res);
@@ -147,16 +109,21 @@ async function entry(modern = preferredModern) {
 	}
 
 	try {
-		await statAsync('./config.json');
+		await statAsync(configPath);
 	} catch (err) {
-		console.error('Please create config.json file, see config.example.json');
+		console.error(`Please create ${configPath} file, see config.example.json`);
 		process.exitCode = 1;
 		return;
 	}
 
 	try {
-		const confRaw = await readFileAsync('./config.json');
+		const confRaw = await readFileAsync(configPath);
 		const conf: IConfigFile = JSON.parse(confRaw.toString());
+
+		if (args[0] === 'speak') {
+			await runSpeak(conf, args.slice(1));
+			return;
+		}
 
 		if (!conf.ip) {
 			const discRes = await discovery.discover();
@@ -174,22 +141,7 @@ async function entry(modern = preferredModern) {
 
 		socketAuth.on('connect', () => {
 			try {
-				const buff = Buffer.alloc(modern ? 520 : 256);
-				const loginReq = new t.Pointer(buff, 0);
-
-				const loginReqData = {
-					command: 1167,
-					deviceId: Buffer.from(conf.id),
-					unknown1: modern ? 120 : 1022,
-					unknown2: modern ? 31 : 2,
-					unknown3: 1,
-					hostDateTime: [],
-					username: Buffer.from(conf.username),
-					password: generatePassword(conf.password, modern).subarray(0, modern ? 64 : 32),
-				}
-
-				loginStruct.pack(loginReq, loginReqData);
-				socketAuth.write(buff);
+				socketAuth.write(createLoginRequest(conf, modern));
 			} catch (err) {
 				failAuth(err instanceof Error ? err.message : String(err));
 			}
@@ -340,7 +292,7 @@ function startStreaming(conf: IConfigFile, resp: any) {
 			socketStream.write(buff);
 
 			stage++;
-			init(conf.serverPort, streamLoginResp, resp);
+			init(conf.serverPort, streamLoginResp, resp, conf.serverHost);
 			startedAt = Date.now();
 			reading = readStreamPacket(socketStream).catch((err) => { socketStream.destroy(err); });
 		} catch (err) {

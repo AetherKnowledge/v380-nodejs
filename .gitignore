@@ -12,3 +12,5 @@ logs
 yarn.lock
 version.json
 dist
+.serena
+.bun-cache/

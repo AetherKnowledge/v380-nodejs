@@ -6,6 +6,12 @@ Based on [prsyahmi/v380](https://github.com/prsyahmi/v380/), the original projec
 
 This version adds newer-firmware support, low-latency video/audio playback, and automatic reconnection.
 
+Speaker packet format and encryption are based on
+[jericjan/v380-audio-player](https://github.com/jericjan/v380-audio-player).
+Credit for that speaker protocol research belongs to
+[jericjan](https://github.com/jericjan) and the project's contributors.
+The Node.js implementation shares this project's login and IMA ADPCM codec.
+
 ### How to run
 1. Install Node.js 22.13+ (22.x), or Node.js 24+; Node.js 24 or 26 is recommended.
 2. Go to this directory and execute `npm ci` (includes the development tools required by `npm start`).
@@ -14,6 +20,14 @@ This version adds newer-firmware support, low-latency video/audio playback, and 
 5. Run `npm run vlc` in a second terminal for fast playback with audio (uses the port in config.json).
 
 Use the camera's device password in `config.json`, separate from the V380 app account password. The client retries with the newer 520-byte login format when a camera rejects the legacy protocol, and decrypts firmware v31 H.264 video and IMA ADPCM audio using communication version 20. Legacy login and unencrypted video remain supported.
+
+The HTTP server listens on **`127.0.0.1` only by default**, including when an
+existing config omits `serverHost`. Local Frigate/go2rtc can continue to use
+`http://127.0.0.1:<serverPort>/live.flv`. To allow LAN access explicitly, set
+`"serverHost": "0.0.0.0"` in `config.json`, or use a specific local interface IP.
+IPv6 addresses such as `::1` are also supported. Restart the bridge after
+changing `serverHost` or `serverPort`. Stream endpoints have no authentication;
+all clients that can reach the configured listening address can access them.
 
 Run checks with `npm run typecheck`, `npm run lint`, and `npm test`.
 Build JavaScript into `build/` with `npm run build`.
@@ -55,8 +69,8 @@ chmod +x v380-linux-x64
 
 The stream is `http://127.0.0.1:<serverPort>/live.flv` when accessed in the same
 network namespace. This endpoint needs no FFmpeg installation. Install FFmpeg
-on the container only if you use the compatibility `/video/stream.flv` or
-encoded `/audio/stream.flv` endpoints.
+on the container if you use the compatibility `/video/stream.flv` or
+encoded `/audio/stream.flv` endpoints, microphone capture, or `speak --test`.
 
 For systemd, also copy the sample `deploy/v380.service` to the container. Its paths
 assume the executable and `config.json` are in `/opt/v380`, owned by a dedicated
@@ -100,6 +114,148 @@ automatically redirect `/live.flv` to that endpoint. Firmware is unchanged.
 The 200 ms player cache is a target, not a measured camera-to-screen latency;
 Wi-Fi jitter and camera encoding still contribute. Increase VLC network caching
 if playback stutters on a busy wireless network.
+
+### Send audio to the camera speaker
+
+Use the same `config.json` device ID, IP, username, and device password. Run
+speaker commands in a separate terminal while the video bridge stays running.
+The command opens its own camera session; it does not start another HTTP server.
+
+Play a WAV file once:
+
+```sh
+npm run speak -- voice.wav
+```
+
+To test the speaker using `test.mp3` in the project directory:
+
+```sh
+npm run test:speaker
+```
+
+This requires FFmpeg, converts the MP3 to a temporary WAV, plays it once using
+`config.json`, and removes the temporary file afterward.
+
+The same test command works in the standalone Linux executable, without Node
+or npm. Install FFmpeg and copy `test.mp3` to the working directory, or give
+an explicit audio file path:
+
+```sh
+cd /opt/v380
+./v380-linux-x64 speak --test
+./v380-linux-x64 --config /opt/v380/config.json speak --test /opt/v380/test.mp3
+```
+
+The MP3 is a separate file; it is not embedded in the executable. `--test`
+accepts any audio format supported by FFmpeg and plays it once. Run this in
+a separate terminal while the bridge service stays running.
+
+The file must be **PCM 16-bit little-endian, 8000 Hz, mono**. Convert other
+formats with FFmpeg first:
+
+```sh
+ffmpeg -i input.mp3 -ac 1 -ar 8000 -c:a pcm_s16le voice.wav
+```
+
+Send a live microphone on Windows (FFmpeg must be installed and in PATH):
+
+```powershell
+ffmpeg -list_devices true -f dshow -i dummy
+npm.cmd run speak -- --mic "Microphone (your exact device name)"
+```
+
+On Linux, use an ALSA input device; the default is `default`:
+
+```sh
+npm run speak -- --mic
+npm run speak -- --mic hw:1,0
+```
+
+Run microphone capture on the computer with the microphone. A headless LXC
+needs an accessible audio device to capture locally. PCM WAV playback needs no
+microphone or FFmpeg installation; `--test` conversion requires FFmpeg.
+
+The standalone executable supports the same commands:
+
+```sh
+./v380-linux-x64 speak voice.wav
+./v380-linux-x64 speak --mic
+```
+
+For another capture source, send raw 8 kHz mono signed 16-bit little-endian PCM
+through stdin, for example from PulseAudio on Linux:
+
+```sh
+ffmpeg -f pulse -i default -ac 1 -ar 8000 -f s16le pipe:1 | ./v380-linux-x64 speak --pcm-stdin
+```
+
+Press Ctrl+C to stop microphone capture and close the camera speaker session.
+Audio is encoded into 505-sample IMA WAV blocks and paced at the recording rate;
+firmware above version 30 uses the session AES key. Playback stops on camera
+disconnect or input failure; it does not automatically replay interrupted audio.
+Speaker playback was confirmed on the v31 camera. No microphone capture or
+speaker control API is exposed through the public HTTP streaming port.
+
+### Talk from Frigate
+
+The bridge supports go2rtc's external-command audio backchannel. This lets
+Frigate's Live view send your browser microphone to the camera without Home
+Assistant or a microphone attached to the LXC.
+
+1. Rebuild with `npm run build:linux` and replace the executable in your LXC at
+   `/opt/v380/v380-linux-x64`. Stop the bridge service before replacing a running
+   executable, then start it again. Keep `/opt/v380/config.json` in place.
+2. Merge the `garage2` source list from [deploy/frigate-v380.yaml](deploy/frigate-v380.yaml)
+   into your existing Frigate config:
+
+   ```yaml
+   go2rtc:
+     streams:
+       garage2:
+         - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=aac"
+         - "ffmpeg:garage2#audio=opus"
+         - "exec:/opt/v380/v380-linux-x64 --config /opt/v380/config.json speak --alaw-stdin#backchannel=1"
+   ```
+
+3. Keep your recording input at `rtsp://127.0.0.1:8554/garage2`, your existing
+   WebRTC candidates/port 8555 configuration, and the rest of your camera settings.
+   Restart Frigate/go2rtc after saving.
+4. Open Frigate at **`https://192.168.254.90:8971`** (or your existing HTTPS URL).
+   Open `garage2`'s individual Live view, allow browser microphone permission,
+   and toggle the microphone control on to talk and off to listen. The dashboard
+   grid is not the talk interface.
+
+The executable is launched by **go2rtc's service account**, which must be able
+to execute the binary, traverse `/opt/v380`, and read the config. Run this check
+as that account if the microphone fails to start:
+
+```sh
+/opt/v380/v380-linux-x64 --config /opt/v380/config.json speak --alaw-stdin </dev/null
+```
+
+It should exit successfully without connecting to the camera. The absolute
+`--config` path is needed because Frigate's working directory differs from the
+bridge service's. Frigate installed directly in the same LXC can use the paths
+and loopback address above; Docker installations need those paths mounted
+inside the go2rtc container.
+
+The browser negotiates PCMA/8000, go2rtc writes raw G.711 A-law to stdin, and the
+bridge decodes it to PCM before encoding/encrypting camera speaker packets.
+The backchannel itself requires no FFmpeg process. It waits for audio bytes
+before opening the speaker; normal viewing does not activate talk mode. A
+750 ms gap in incoming microphone packets closes the speaker session even if
+go2rtc leaves stdin open. That gap is a network inactivity timeout, not voice
+activation: silence is still sent while Frigate's microphone control is on.
+
+This camera mutes its own microphone while the speaker session is active,
+including a short firmware delay after it closes. Turn Frigate's microphone
+off to hear the camera again. This integration does not enable full-duplex
+audio. Only one talk session should be active at a time.
+
+The browser-to-go2rtc-to-camera-packet path was verified with generated silence
+and a simulated camera against go2rtc **1.9.8**. Frigate **0.14.1**'s microphone
+signaling was checked for compatibility; the installed Frigate configuration
+still needs the source entry above applied locally.
 
 ### Status
 - The camera connection stays active while the application runs. New viewers receive a complete cached keyframe chain, or wait for the next keyframe if the cache limit was reached.

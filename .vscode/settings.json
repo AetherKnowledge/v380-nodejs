@@ -6,8 +6,6 @@
 	"files.exclude": {
 		"node_modules": true,
 		"build/": true,
-		"dist/": true,
-		"database/": true,
-		"logs/": true
+		"database/": true
 	}
 }

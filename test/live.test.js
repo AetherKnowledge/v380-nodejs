@@ -5,7 +5,11 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require('typescript');
-const context = { exports: {}, Buffer };
+const imaContext = { exports: {}, Buffer };
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname, '../src/ima.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2017 },
+}).outputText, imaContext);
+const context = { exports: {}, Buffer, require: name => name === './ima' ? imaContext.exports : require(name) };
 vm.runInNewContext(ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname, '../src/live.ts'), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2017 },
 }).outputText, context);

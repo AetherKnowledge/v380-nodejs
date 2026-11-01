@@ -21,7 +21,11 @@ const appSource = source('app.ts');
 const streamSource = source('stream.ts');
 const socketContext = { exports: {} };
 vm.runInNewContext(source('socket.ts'), socketContext);
-const liveContext = { exports: {}, Buffer };
+const imaContext = { exports: {}, Buffer };
+vm.runInNewContext(source('ima.ts'), imaContext);
+const authContext = { exports: {}, Buffer, require };
+vm.runInNewContext(source('auth.ts'), authContext);
+const liveContext = { exports: {}, Buffer, require: name => name === './ima' ? imaContext.exports : require(name) };
 vm.runInNewContext(source('live.ts'), liveContext);
 const { readCameraBytes } = socketContext.exports;
 
@@ -59,9 +63,10 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-async function loadApp(clock = Date) {
-  const sockets = [], errors = [], initialized = [], timers = [], resets = [], logs = [];
-  const fakeProcess = { argv: [], exitCode: 0 };
+async function loadApp(clock = Date, argv = [], overrides = {}) {
+  const sockets = [], errors = [], initialized = [], timers = [], resets = [], logs = [], configPaths = [];
+  const spoken = [];
+  const fakeProcess = { argv, exitCode: 0 };
   vm.runInNewContext(appSource, {
     exports: {}, Buffer, process: fakeProcess, Date: clock,
     setTimeout(callback, delay) { const timer = { callback, delay }; timers.push(timer); return timer; },
@@ -69,12 +74,14 @@ async function loadApp(clock = Date) {
     require(name) {
       if (name === 'process') return fakeProcess;
       if (name === './discovery') return {};
+      if (name === './auth') return authContext.exports;
+      if (name === './speak') return { runSpeak: (...args) => spoken.push(args) };
       if (name === './socket') return socketContext.exports;
       if (name === './live') return liveContext.exports;
       if (name === './stream') return { init: (...args) => initialized.push(args), reset: () => resets.push(true), handleStream() {} };
       if (name === 'fs') return {
-        stat: (file, cb) => cb(null, {}),
-        readFile: (file, cb) => cb(null, Buffer.from(JSON.stringify(config))),
+        stat: (file, cb) => { configPaths.push(file); cb(null, {}); },
+        readFile: (file, cb) => { configPaths.push(file); cb(null, Buffer.from(JSON.stringify({ ...config, ...overrides }))); },
       };
       if (name === 'net') return { connect() {
         const socket = new FakeSocket();
@@ -85,7 +92,7 @@ async function loadApp(clock = Date) {
     },
   });
   await new Promise(setImmediate);
-  return { sockets, errors, initialized, fakeProcess, timers, resets, logs,
+  return { sockets, errors, initialized, fakeProcess, timers, resets, logs, spoken, configPaths,
     async retry() {
       assert.ok(timers.length, 'Expected a scheduled reconnect');
       const timer = timers.shift(); timer.callback();
@@ -103,6 +110,24 @@ function authReply(command = 1168, result = 1001, version = 2) {
   data.writeUInt32LE(42, 13);
   return data;
 }
+
+test('speak CLI dispatch uses existing config without opening the video connection', async () => {
+  const app = await loadApp(Date, ['node', 'app.ts', 'speak', '--mic', 'test device']);
+  assert.equal(app.sockets.length, 0);
+  assert.equal(app.initialized.length, 0);
+  assert.equal(app.spoken.length, 1);
+  assert.equal(app.spoken[0][0].id, config.id);
+  assert.deepEqual(Array.from(app.spoken[0][1]), ['--mic', 'test device']);
+});
+
+test('go2rtc CLI uses explicit config path without starting the video server', async () => {
+  const app = await loadApp(Date, ['node', 'app.ts', '--config', '/opt/v380/config.json', 'speak', '--alaw-stdin']);
+  assert.deepEqual(app.configPaths, ['/opt/v380/config.json', '/opt/v380/config.json']);
+  assert.equal(app.sockets.length, 0);
+  assert.equal(app.initialized.length, 0);
+  assert.equal(app.spoken.length, 1);
+  assert.deepEqual(Array.from(app.spoken[0][1]), ['--alaw-stdin']);
+});
 
 async function modernAttempt(app) {
   const legacy = app.sockets[0];
@@ -319,11 +344,11 @@ test('legacy stream-start bytes stay compatible for all accepted response codes'
   }
 });
 
-function loadMedia(auth, ffmpegFactory) {
+function loadMedia(auth, ffmpegFactory, listenHost) {
   const routes = {}, listens = [];
   const context = { exports: {}, Buffer, console: { log() {}, error() {} }, setTimeout,
     require(name) {
-      if (name === 'express') return () => ({ listen: port => listens.push(port), get: (url, handler) => { routes[url] = handler; } });
+      if (name === 'express') return () => ({ listen: (port, host) => listens.push({ port, host }), get: (url, handler) => { routes[url] = handler; } });
       if (name === './socket') return socketContext.exports;
       if (name === './live') return liveContext.exports;
       if (name === 'fluent-ffmpeg' && ffmpegFactory) return ffmpegFactory;
@@ -333,9 +358,42 @@ function loadMedia(auth, ffmpegFactory) {
   vm.runInNewContext(streamSource + '\nglobalThis.decodeForTest = decodeVideoFrame; globalThis.audioForTest = { decode: decodeAudioFrame, waveHeader: createAudioWaveHeader, streams: audStreams }; globalThis.clientsForTest = { createStream, removeStream, video: vidStreams, cached: () => ({ iFrame, pFrame }) };', context);
   context.routesForTest = routes;
   context.listensForTest = listens;
-  context.exports.init(4000, { width: 1920, height: 1080, maybeFps: 20 }, auth);
+  context.exports.init(4000, { width: 1920, height: 1080, maybeFps: 20 }, auth, listenHost);
   return context;
 }
+
+test('HTTP binds to loopback by default and only exposes other interfaces when configured', () => {
+  const auth = { version: 31, authTicket: 42 };
+  assert.deepEqual(loadMedia(auth).listensForTest, [{ port: 4000, host: '127.0.0.1' }]);
+  for (const host of ['127.0.0.1', '0.0.0.0', '192.168.1.10', '::1', '::']) {
+    assert.deepEqual(loadMedia(auth, undefined, host).listensForTest, [{ port: 4000, host }]);
+  }
+  for (const host of ['', null, 0, 'localhost', 'not-an-ip']) {
+    assert.throws(() => loadMedia(auth, undefined, host), /serverHost must be/);
+  }
+});
+
+test('configured serverHost is passed from config through camera login to the HTTP server', async () => {
+  const app = await loadApp(Date, [], { serverHost: '0.0.0.0' });
+  await openModernStream(app);
+  assert.equal(app.initialized[0][3], '0.0.0.0');
+});
+
+test('FFmpeg internal audio follows wildcard, IPv6, and specific-interface bindings', async () => {
+  const { PassThrough } = require('node:stream');
+  for (const [host, expected] of [['127.0.0.1', '127.0.0.1'], ['0.0.0.0', '127.0.0.1'], ['192.168.1.10', '192.168.1.10'], ['::1', '[::1]'], ['::', '[::1]']]) {
+    const inputs = [];
+    const command = new Proxy({}, { get(target, method) {
+      return (...args) => { if (method === 'input') inputs.push(args[0]); return command; };
+    } });
+    const media = loadMedia({ version: 31, authTicket: 42 }, () => command, host);
+    const response = new PassThrough(); response.contentType = () => {};
+    media.routesForTest['/video/:filename']({}, response);
+    assert.equal(inputs[1], `http://${expected}:4000/audio/stream.wav`);
+    response.destroy();
+  }
+  await new Promise(setImmediate);
+});
 
 test('firmware v31 decryption strips frame headers and preserves clear blocks and tails', () => {
   const key = Buffer.from('2a0000005c79142c46238161f00d8082', 'hex');
@@ -541,7 +599,7 @@ test('session reset drops partial fragments/cached video, closes old feeds, and 
   const frame = recovered.stream.read();
   assert.equal(frame.length, 2);
   assert.equal(frame.readUInt16LE(), 7);
-  assert.deepEqual(media.listensForTest, [4000]);
+  assert.deepEqual(media.listensForTest, [{ port: 4000, host: '127.0.0.1' }]);
   media.clientsForTest.removeStream(recovered);
 });
 

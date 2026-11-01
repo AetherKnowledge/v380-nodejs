@@ -1,7 +1,7 @@
 // import beamcoder = require('beamcoder');
 import ffmpeg = require('fluent-ffmpeg');
 import express = require('express');
-import { Socket } from 'net';
+import { isIP, Socket } from 'net';
 import * as t from 'typebase';
 import * as stream from 'stream';
 import * as crypto from 'crypto';
@@ -28,6 +28,7 @@ let width = 0;
 let height = 0;
 let fps = 0;
 let serverPort = 0;
+let audioHost = '127.0.0.1';
 let mediaKey: Buffer | undefined;
 let listening = false;
 const app = express();
@@ -40,7 +41,10 @@ let pFrame: Buffer[] = [];
 let iFrame: Buffer | undefined;
 let videoCacheBytes = 0;
 
-export function init(listenPort: number, packet: any, auth?: { version: number; authTicket: number }) {
+export function init(listenPort: number, packet: any, auth?: { version: number; authTicket: number }, listenHost = '127.0.0.1') {
+	if (typeof listenHost !== 'string' || !isIP(listenHost)) {
+		throw new Error('serverHost must be an IPv4 or IPv6 address; default is 127.0.0.1');
+	}
 	reset();
 	width = packet.width;
 	height = packet.height;
@@ -57,9 +61,13 @@ export function init(listenPort: number, packet: any, auth?: { version: number; 
 	console.log(mediaKey ? `${width}x${height} (camera timestamps)` : `${width}x${height} @ ${fps} fps`);
 
 	if (!listening) {
-		app.listen(listenPort);
+		app.listen(listenPort, listenHost);
+		// FFmpeg must reach the address actually bound, including IPv6-only or
+		// specific LAN interfaces. Wildcard bindings use their loopback address.
+		const localHost = listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost === '::' ? '::1' : listenHost;
+		audioHost = isIP(localHost) === 6 ? `[${localHost}]` : localHost;
 		listening = true;
-		console.log(`Server started at port ${serverPort}`);
+		console.log(`Server started at http://${audioHost}:${serverPort} (bind ${listenHost})`);
 	}
 }
 
@@ -328,7 +336,7 @@ app.get('/video/:filename', (req, res) => {
 	if (mediaKey) {
 		f.withInputOption(['-use_wallclock_as_timestamps 1']);
 		// Decode audio in this muxer instead of waiting on a second FFmpeg process.
-		f.input(`http://127.0.0.1:${serverPort}/audio/stream.wav`)
+		f.input(`http://${audioHost}:${serverPort}/audio/stream.wav`)
 			.withInputOption(['-f wav', '-ignore_length 1', '-max_size 256', '-probesize 32', '-analyzeduration 100000'])
 			.audioCodec('aac')
 			.audioBitrate('32k')
@@ -336,7 +344,7 @@ app.get('/video/:filename', (req, res) => {
 			.audioChannels(1);
 	} else {
 		f.withInputFPS(fps)
-			.input(`http://127.0.0.1:${serverPort}/audio/stream.flv`)
+			.input(`http://${audioHost}:${serverPort}/audio/stream.flv`)
 			.withInputOption(['-probesize 65536', '-analyzeduration 500000'])
 			.audioCodec('copy');
 	}

@@ -1,0 +1,10 @@
+# Merge this garage2 source list into your existing Frigate configuration.
+# Keep your existing WebRTC candidates, camera recording, and other settings.
+# Install the rebuilt executable at /opt/v380/v380-linux-x64 first.
+# The go2rtc service account must be able to read /opt/v380/config.json.
+go2rtc:
+  streams:
+    garage2:
+      - "ffmpeg:http://127.0.0.1:8800/live.flv#video=copy#audio=aac"
+      - "ffmpeg:garage2#audio=opus"
+      - "exec:/opt/v380/v380-linux-x64 --config /opt/v380/config.json speak --alaw-stdin#backchannel=1"
