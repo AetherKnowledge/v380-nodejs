@@ -23,7 +23,7 @@ declare module 'typebase' {
 		define(type: IType, length?: number): List;
 	};
 
-	export interface Struct extends IType {}
+	export type Struct = IType;
 	export const Struct: {
 		define(fields: ([string, IType] | Struct)[], name?: string): Struct;
 	};

@@ -9,7 +9,6 @@ test/build
 logs
 *.log
 *.pem
-package-lock.json
 yarn.lock
 version.json
 dist

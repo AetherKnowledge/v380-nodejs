@@ -4,11 +4,9 @@
 		{
 			"type": "npm",
 			"script": "dev",
-			"problemMatcher": [
-				"$eslint-compact"
-			],
+			"problemMatcher": [],
 			"label": "npm: dev",
-			"detail": "nodemon"
+			"detail": "Node.js watch mode"
 		}
 	]
 }

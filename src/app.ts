@@ -34,22 +34,6 @@ const streamLoginLanStruct = t.Struct.define([
 	['unknown6', t.ui32],   // 30: unused
 ]);
 
-const streamLoginCloudStruct = t.Struct.define([
-	['command', t.i32],
-	['unknown1', t.ui32],   // 1022
-	['domain', t.List.define(t.ui8, 32)],
-	['unknown2', t.List.define(t.ui8, 18)],
-	['camPort', t.ui16],    // 58: v15 + 180 = 0x60 0x22 0x31 0x37 "8800"
-	['unknown3', t.ui16],   // 60: This is not used (corrupted overlapped with domain/padding)
-	['deviceId', t.ui32],   // 62: v51
-	['authTicket', t.ui32], // 66: v49
-	['session', t.ui32],    // 70: v52
-	['unknown4', t.ui32],   // 74: v57 = 0
-	['unknown5', t.ui8],    // 78: = 20 hardcoded
-	['unknown6', t.ui32],   // 79: v14 = 0x1001
-	['unknown7', t.ui32],   // 83: v56 = 0
-]);
-
 const streamStartStruct = t.Struct.define([
 	['command', t.i32],
 	['unknown1', t.ui32],
@@ -99,10 +83,6 @@ interface IConfigFile {
 	username: string;
 	password: string;
 	serverPort: number;
-}
-
-if (0) {
-	console.log(loginStruct, loginRespStruct, streamLoginCloudStruct, streamLoginLanStruct, streamLogin301RespStruct);
 }
 
 function generatePassword(password: string, modern = false) {
@@ -170,6 +150,7 @@ async function entry(modern = preferredModern) {
 		await statAsync('./config.json');
 	} catch (err) {
 		console.error('Please create config.json file, see config.example.json');
+		process.exitCode = 1;
 		return;
 	}
 
@@ -281,6 +262,7 @@ async function entry(modern = preferredModern) {
 
 entry().catch((err) => {
 	console.error(err);
+	process.exitCode = 1;
 })
 
 function startStreaming(conf: IConfigFile, resp: any) {

@@ -1,0 +1,16 @@
+[Unit]
+Description=V380 camera video and audio bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=v380
+Group=v380
+WorkingDirectory=/opt/v380
+ExecStart=/opt/v380/v380-linux-x64
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
